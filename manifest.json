@@ -1,8 +1,8 @@
 {
     "display_name": "ST Multiplayer",
     "version": "3.4.1",
-    "js": "index_3_4_1.js",
-    "css": "style_3_4_1.css",
+    "js": "index_3_4_1_1.js",
+    "css": "style_3_4_1_1.css",
     "author": "nattaphar010447",
     "description": "Multiplayer extension for SillyTavern. Allows multiple users to play together in real-time.",
     "homepage": "https://github.com/nattaphar010447/nutho_sillytavern_multiplayer_p2p_extension",

@@ -1,6 +1,6 @@
 # ST Multiplayer
 
-**Version 3.3.0** — A peer-to-peer multiplayer extension for [SillyTavern](https://github.com/SillyTavern/SillyTavern).
+**Version 3.4.1** — A peer-to-peer multiplayer extension for [SillyTavern](https://github.com/SillyTavern/SillyTavern).
 
 Multiple players collaborate with a single AI character in real time. Everyone types their message, clicks Ready, and the host merges all inputs into one combined message before sending it to the AI. No dedicated server required — connections are established directly between browsers via WebRTC.
 
@@ -36,6 +36,7 @@ Multiple players collaborate with a single AI character in real time. Everyone t
 
 ### Reliability
 
+- Auto-retry on PeerJS broker disconnect (3 attempts, 1s → 3s → 6s backoff) before giving up.
 - Auto-reconnect with exponential backoff (2s → 5s → 10s, up to 3 attempts).
 - Session snapshot stored in `sessionStorage` for recovery after tab freeze or crash.
 - Heartbeat / keepalive with zombie client detection (90s timeout).

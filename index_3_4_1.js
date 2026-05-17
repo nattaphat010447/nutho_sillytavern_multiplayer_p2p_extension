@@ -99,6 +99,14 @@ const RECONNECT_DELAYS     = [2000, 5000, 10000]; // ms — exponential backoff
 let reconnectAttempts  = 0;
 let reconnectTimer     = null;
 let isReconnecting     = false;
+let _brokerRetryTimer  = null;       // pending broker-retry setTimeout handle
+
+const BROKER_RETRY_DELAYS = [1000, 3000, 6000]; // ms — 1s, 3s, 6s
+
+/** Returns true for errors that indicate the PeerJS broker is unreachable. */
+function isBrokerNetworkErr(err) {
+    return err && (err.type === 'network' || err.type === 'socket-error' || err.type === 'server-error');
+}
 
 // ===== STATE: SESSION SNAPSHOT (Phase 2 — B1) =====
 const MP_SESSION_KEY = 'mp-session';    // sessionStorage key
@@ -1931,63 +1939,77 @@ async function mpHost() {
         await loadPeerJS();
         const roomCode = generateRoomCode();
         const peerConfig = await buildPeerConfigAsync();
-        peer = new window.Peer(roomCode, peerConfig);
-        setStatus('Creating room...');
 
-        peer.on('open', (id) => {
-            const codeEl = document.getElementById('mp-room-code');
-            if (codeEl) codeEl.textContent = id;
+        let _hostOpened = false;
+        let _hostBrokerRetries = 0;
 
-            isHost = true;
-            myName = getMyName();
-            players[id] = { name: myName, text: '', ready: false, description: '', preview: null, readyAt: null, role: 'player' };
-            manualOrder  = [id];
+        function _tryCreateHostPeer() {
+            if (peer) { try { peer.destroy(); } catch {} peer = null; }
+            peer = new window.Peer(roomCode, peerConfig);
+            setStatus('Creating room...');
 
-            switchToRoom(true);
-            renderPlayerList();
-            if (roomMode === 'normal') broadcastPreviewUpdate();
-            integrateSTInput();
-            startHostHeartbeat();
-            bindHostDiffEvents();       // B: start broadcasting edits/deletes/swipes to clients
-            acquireWakeLock();          // A1
-            saveSessionSnapshot();      // B1
-            _hostingInFlight = false;
-            _setConnBtnState(false);
-            setStatus(`Waiting for players to join... (${roomMode === 'hidden' ? 'Hidden' : 'Normal'} mode)`);
-        });
+            peer.on('open', (id) => {
+                _hostOpened = true;
+                const codeEl = document.getElementById('mp-room-code');
+                if (codeEl) codeEl.textContent = id;
 
-        peer.on('connection', conn => setupHostClientConn(conn));
+                isHost = true;
+                myName = getMyName();
+                players[id] = { name: myName, text: '', ready: false, description: '', preview: null, readyAt: null, role: 'player' };
+                manualOrder  = [id];
 
-        peer.on('error', err => {
-            console.error('[MP-Sync] Peer error:', err);
-            if (err.type === 'unavailable-id') {
-                setStatus('Code unavailable. Trying a new one...');
-                peer.destroy();
-                peer = null;
-                _hostingInFlight = false;   // reset BEFORE recurse so guard allows re-entry
-                _setConnBtnState(false);
-                setTimeout(() => mpHost(), 500);
-            } else if (err.type === 'network' || err.type === 'server-error') {
+                switchToRoom(true);
+                renderPlayerList();
+                if (roomMode === 'normal') broadcastPreviewUpdate();
+                integrateSTInput();
+                startHostHeartbeat();
+                bindHostDiffEvents();       // B: start broadcasting edits/deletes/swipes to clients
+                acquireWakeLock();          // A1
+                saveSessionSnapshot();      // B1
                 _hostingInFlight = false;
                 _setConnBtnState(false);
-                const hasPack = !!loadPackConfig();
-                const hasOR = isOpenRelayEnabled();
-                setStatus(hasPack
-                    ? '⚠ Connection failed — check your Server Pack settings'
-                    : hasOR
-                        ? '⚠ Connection failed — OpenRelay may be busy, try again or use a private Pack'
-                        : '⚠ Connection failed — enable Free Public TURN (Network tab) or add a Pack');
-            } else {
-                _hostingInFlight = false;
-                _setConnBtnState(false);
-                setStatus(`Failed to create room: ${err.type}`);
-            }
-        });
+                setStatus(`Waiting for players to join... (${roomMode === 'hidden' ? 'Hidden' : 'Normal'} mode)`);
+            });
+
+            peer.on('connection', conn => setupHostClientConn(conn));
+
+            peer.on('error', err => {
+                console.error('[MP-Sync] Peer error:', err);
+                if (err.type === 'unavailable-id') {
+                    setStatus('Code unavailable. Trying a new one...');
+                    peer.destroy();
+                    peer = null;
+                    _hostingInFlight = false;   // reset BEFORE recurse so guard allows re-entry
+                    _setConnBtnState(false);
+                    setTimeout(() => mpHost(), 500);
+                } else if (!_hostOpened && isBrokerNetworkErr(err) && _hostBrokerRetries < BROKER_RETRY_DELAYS.length) {
+                    // Broker unreachable before connection opened — retry with backoff
+                    const retryDelay = BROKER_RETRY_DELAYS[_hostBrokerRetries];
+                    const attempt = _hostBrokerRetries + 1;
+                    const total = BROKER_RETRY_DELAYS.length;
+                    _hostBrokerRetries++;
+                    console.warn(`[MP-Sync] Broker unreachable (host), retrying ${attempt}/${total} in ${retryDelay}ms`);
+                    setStatus(`⚠ PeerJS server unreachable — retrying in ${retryDelay / 1000}s (${attempt}/${total})...`);
+                    try { peer.destroy(); } catch {} peer = null;
+                    _brokerRetryTimer = setTimeout(_tryCreateHostPeer, retryDelay);
+                } else if (err.type === 'network' || err.type === 'server-error') {
+                    _hostingInFlight = false;
+                    _setConnBtnState(false);
+                    setStatus('⚠ Cannot reach PeerJS broker. Try disabling ad-blockers / antivirus / VPN, or use another browser.');
+                } else {
+                    _hostingInFlight = false;
+                    _setConnBtnState(false);
+                    setStatus(`Failed to create room: ${err.type}`);
+                }
+            });
+        }
+
+        _tryCreateHostPeer();
     } catch (err) {
         _hostingInFlight = false;
         _setConnBtnState(false);
         console.error(err);
-        setStatus('Failed to connect to PeerJS. Please try again.');
+        setStatus('Failed to connect to PeerJS broker. Check your internet, then try again.');
     }
 }
 
@@ -2012,41 +2034,59 @@ async function mpJoin() {
         try {
             await loadPeerJS();
             const peerConfig = await buildPeerConfigAsync();
-            peer = new window.Peer(undefined, peerConfig);
-            setStatus('Connecting...');
 
-            peer.on('open', () => {
-                _joiningInFlight = false;
-                _setConnBtnState(false);
-                hostConn = peer.connect(roomCode);
-                isHost = false;
-                myName = getMyName();
-                setupClientConn(hostConn);
-            });
+            let _joinOpened = false;
+            let _joinBrokerRetries = 0;
 
-            peer.on('error', err => {
-                console.error('[MP-Sync] Peer error:', err);
-                _joiningInFlight = false;
-                _setConnBtnState(false);
-                if (err.type === 'peer-unavailable') {
-                    setStatus('Room code not found. Please check the code and try again.');
+            function _tryCreateJoinPeer() {
+                if (peer) { try { peer.destroy(); } catch {} peer = null; }
+                peer = new window.Peer(undefined, peerConfig);
+                setStatus('Connecting...');
 
-                } else if (err.type === 'network' || err.type === 'server-error') {
-                    const hasPack = !!loadPackConfig();
-                    const hasOR = isOpenRelayEnabled();
-                    setStatus(hasPack
-                        ? '⚠ Connection failed — check your Server Pack settings'
-                        : hasOR
-                            ? '⚠ Connection failed — OpenRelay may be busy, try again or use a private Pack'
-                            : '⚠ Connection failed — enable Free Public TURN (Network tab) or add a Pack');
-                } else
-                    setStatus(`Failed to join room: ${err.type}`);
-            });
+                peer.on('open', () => {
+                    _joinOpened = true;
+                    _joiningInFlight = false;
+                    _setConnBtnState(false);
+                    hostConn = peer.connect(roomCode);
+                    isHost = false;
+                    myName = getMyName();
+                    setupClientConn(hostConn);
+                });
+
+                peer.on('error', err => {
+                    console.error('[MP-Sync] Peer error:', err);
+                    if (err.type === 'peer-unavailable') {
+                        _joiningInFlight = false;
+                        _setConnBtnState(false);
+                        setStatus('Room code not found. Please check the code and try again.');
+                    } else if (!_joinOpened && isBrokerNetworkErr(err) && _joinBrokerRetries < BROKER_RETRY_DELAYS.length) {
+                        // Broker unreachable before connection opened — retry with backoff
+                        const retryDelay = BROKER_RETRY_DELAYS[_joinBrokerRetries];
+                        const attempt = _joinBrokerRetries + 1;
+                        const total = BROKER_RETRY_DELAYS.length;
+                        _joinBrokerRetries++;
+                        console.warn(`[MP-Sync] Broker unreachable (join), retrying ${attempt}/${total} in ${retryDelay}ms`);
+                        setStatus(`⚠ PeerJS server unreachable — retrying in ${retryDelay / 1000}s (${attempt}/${total})...`);
+                        try { peer.destroy(); } catch {} peer = null;
+                        _brokerRetryTimer = setTimeout(_tryCreateJoinPeer, retryDelay);
+                    } else if (err.type === 'network' || err.type === 'server-error') {
+                        _joiningInFlight = false;
+                        _setConnBtnState(false);
+                        setStatus('⚠ Cannot reach PeerJS broker. Try disabling ad-blockers / antivirus / VPN, or use another browser.');
+                    } else {
+                        _joiningInFlight = false;
+                        _setConnBtnState(false);
+                        setStatus(`Failed to join room: ${err.type}`);
+                    }
+                });
+            }
+
+            _tryCreateJoinPeer();
         } catch (err) {
             _joiningInFlight = false;
             _setConnBtnState(false);
             console.error(err);
-            setStatus('Failed to connect to PeerJS. Please try again.');
+            setStatus('Failed to connect to PeerJS broker. Check your internet, then try again.');
         }
     });
 
@@ -2253,6 +2293,8 @@ function mpDisconnect() {
     _joiningInFlight = false;
     _setConnBtnState(false);
 
+    // Cancel any pending broker-retry timer
+    if (_brokerRetryTimer) { clearTimeout(_brokerRetryTimer); _brokerRetryTimer = null; }
     cancelReconnect();   // stop any pending reconnect loop
     releaseWakeLock();   // A1: release screen wake lock
 
@@ -2916,6 +2958,7 @@ function cancelReconnect() {
     isReconnecting = false;
     reconnectAttempts = 0;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (_brokerRetryTimer) { clearTimeout(_brokerRetryTimer); _brokerRetryTimer = null; }
     clearSessionSnapshot();
 }
 
@@ -2930,10 +2973,10 @@ function loadPeerJS() {
         script.src = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
         script.onload = () => resolve();
         script.onerror = () => {
-            console.error('[MP-Sync] Failed to load PeerJS');
-            setStatus('Failed to load PeerJS');
-            alert('Failed to load PeerJS. Please check your internet connection.');
-            reject(new Error('Failed to load PeerJS'));
+            console.error('[MP-Sync] Failed to load PeerJS library');
+            setStatus('Failed to load PeerJS library');
+            alert('Failed to load PeerJS library. Check your internet, ad-blocker, or firewall.');
+            reject(new Error('Failed to load PeerJS library'));
         };
         document.head.appendChild(script);
     });
@@ -3335,7 +3378,7 @@ function setupUI() {
                     </div>
                     <div class="mp-about">
                         <p class="mp-about-name">ST Multiplayer</p>
-        <p class="mp-note">v3.4.0 · ${skvojannxlad()}</p>
+        <p class="mp-note">v3.4.1 · ${skvojannxlad()}</p>
                     </div>
                 </div>
             </details>
@@ -3712,7 +3755,7 @@ async function init() {
             });
         }
 
-        console.log('[MP-Sync] Extension loaded v3.4.0');
+        console.log('[MP-Sync] Extension loaded v3.4.1');
     } catch (err) {
         console.error('[MP-Sync] Init error:', err);
     }
